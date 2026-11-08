@@ -1,0 +1,6 @@
+publish/
+*.sys
+*.user
+*.log
+bin/
+obj/
