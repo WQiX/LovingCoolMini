@@ -37,7 +37,7 @@ namespace LovingCoolMini
                 Logger logger = new Logger();
                 AppConfig config = AppConfig.Load(logger);
 
-                logger.Info("LOVINGCOOL Mini 启动，版本 1.0.0，管理员=" + IsAdministrator() +
+                logger.Info("LOVINGCOOL Mini 启动，版本 1.1.0，管理员=" + IsAdministrator() +
                             "，参数=" + string.Join(" ", args ?? new string[0]));
 
                 Application.ThreadException += delegate(object sender, ThreadExceptionEventArgs e)

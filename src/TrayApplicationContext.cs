@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Threading;
@@ -14,19 +15,22 @@ namespace LovingCoolMini
         private readonly NotifyIcon _tray;
         private readonly ContextMenuStrip _menu;
         private readonly ToolStripMenuItem _autoStartItem;
+        private readonly ToolStripMenuItem _cpuItem;
+        private readonly ToolStripMenuItem _gpuItem;
         private readonly SensorReader _sensor;
         private readonly HidDevice _hid;
         private readonly Thread _hidThread;
         private volatile bool _exit;
-        private SensorReading _latest;
+        private SensorSnapshot _snapshot;
         private bool _hidConnected;
         private bool _autoStartEnabled;
         private DateTime _lastHeartbeat;
         private DateTime _lastMemoryLog;
         private DateTime _lastTrim;
         private readonly DateTime _startTime;
-        private bool _firstReadingLogged;
         private bool _firstWriteLogged;
+        private bool _steadyMemoryLogged;
+        private string _lastWriteSource = string.Empty;
         private int _lastSentTemp = int.MinValue;
         private bool _balloonShown;
 
@@ -43,6 +47,9 @@ namespace LovingCoolMini
             _form.AutoStartClicked += FormAutoStartClicked;
             _form.HideToTrayClicked += FormHideToTrayClicked;
             _form.OpenLogClicked += FormOpenLogClicked;
+            _form.SourceChanged += FormSourceChanged;
+            _form.GpuChanged += FormGpuChanged;
+            _form.SetSelection(_config.TemperatureSource, _config.GpuId);
 
             _menu = new ContextMenuStrip();
             _menu.ShowImageMargin = false;
@@ -56,6 +63,22 @@ namespace LovingCoolMini
             showItem.ForeColor = Theme.Text;
             showItem.Click += ShowItemClick;
             _menu.Items.Add(showItem);
+            _menu.Items.Add(new ToolStripSeparator());
+
+            _cpuItem = new ToolStripMenuItem("显示 CPU 温度");
+            _cpuItem.ForeColor = Theme.Text;
+            _cpuItem.Click += CpuItemClick;
+            _menu.Items.Add(_cpuItem);
+
+            _gpuItem = new ToolStripMenuItem("显示 GPU 温度");
+            _gpuItem.ForeColor = Theme.Text;
+            _gpuItem.Click += GpuItemClick;
+            _menu.Items.Add(_gpuItem);
+
+            ToolStripMenuItem chooseGpuItem = new ToolStripMenuItem("选择显卡...");
+            chooseGpuItem.ForeColor = Theme.Text;
+            chooseGpuItem.Click += ShowItemClick;
+            _menu.Items.Add(chooseGpuItem);
             _menu.Items.Add(new ToolStripSeparator());
 
             _autoStartItem = new ToolStripMenuItem("开机自启");
@@ -82,7 +105,7 @@ namespace LovingCoolMini
             _tray.DoubleClick += TrayDoubleClick;
 
             _sensor = new SensorReader(_logger, _config.RefreshMs);
-            _sensor.ReadingAvailable += SensorReadingAvailable;
+            _sensor.SnapshotAvailable += SensorSnapshotAvailable;
             _sensor.StatusChanged += SensorStatusChanged;
 
             _hid = new HidDevice(_logger);
@@ -94,6 +117,7 @@ namespace LovingCoolMini
             _hidThread.Start();
 
             ApplyAutoStartOnStartup();
+            UpdateSourceChecks();
             _sensor.Start();
 
             // Force the form handle to exist even when starting minimized, so
@@ -180,14 +204,11 @@ namespace LovingCoolMini
             timer.Start();
         }
 
-        private void SensorReadingAvailable(object sender, SensorReadingEventArgs e)
+        private void SensorSnapshotAvailable(object sender, SensorSnapshotEventArgs e)
         {
-            _latest = e.Reading;
-            if (!_firstReadingLogged)
-            {
-                _firstReadingLogged = true;
-                _logger.Info("首次读取温度: " + e.Reading.SensorName + " = " + e.Reading.Tctl.ToString("F2") + "°C");
-            }
+            _snapshot = e.Snapshot;
+            EnsureSelectedGpu();
+
             if ((DateTime.Now - _lastMemoryLog).TotalSeconds >= 300)
             {
                 _lastMemoryLog = DateTime.Now;
@@ -208,15 +229,36 @@ namespace LovingCoolMini
             {
                 TrimWorkingSet();
             }
-            _form.UpdateReading(e.Reading);
-            _form.UpdateSensorStatus(true, e.Reading.SensorName + " · " + e.Reading.Time.ToString("HH:mm:ss"));
-            try
+            if (!_steadyMemoryLogged && (DateTime.Now - _startTime).TotalSeconds >= 30)
             {
-                _tray.Text = Truncate("LOVINGCOOL Mini · CPU " + e.Reading.Tctl.ToString("F1") + "°C", 63);
+                _steadyMemoryLogged = true;
+                try
+                {
+                    using (Process p = Process.GetCurrentProcess())
+                    {
+                        _logger.Info("稳定内存: WorkingSet=" + (p.WorkingSet64 / 1024 / 1024) +
+                                     "MB, Private=" + (p.PrivateMemorySize64 / 1024 / 1024) + "MB");
+                    }
+                }
+                catch
+                {
+                }
             }
-            catch
+
+            _form.UpdateSnapshot(e.Snapshot, _config.GpuId);
+            bool anyTemperature = e.Snapshot.CpuAvailable;
+            foreach (GpuReading gpu in e.Snapshot.Gpus)
             {
+                if (gpu.HasTemperature)
+                {
+                    anyTemperature = true;
+                    break;
+                }
             }
+            _form.UpdateSensorStatus(anyTemperature,
+                anyTemperature ? "传感器已启动" : "暂时读不到温度，正在重试...");
+            UpdateSourceChecks();
+            UpdateTrayText();
         }
 
         private void SensorStatusChanged(object sender, SensorStatusEventArgs e)
@@ -235,6 +277,101 @@ namespace LovingCoolMini
             if (e.Connected)
             {
                 _lastSentTemp = int.MinValue;
+            }
+        }
+
+        private void EnsureSelectedGpu()
+        {
+            if (_snapshot == null || _snapshot.Gpus.Count == 0) return;
+            GpuReading selected = FindGpu(_config.GpuId);
+            if (selected == null)
+            {
+                selected = ChooseDefaultGpu(_snapshot.Gpus);
+            }
+            if (selected != null && _config.GpuId != selected.Id)
+            {
+                _config.GpuId = selected.Id;
+                _config.Save(_logger);
+                _logger.Info("默认显卡: " + selected.Vendor + " | " + selected.Name + " | id=" + selected.Id +
+                             " | sensor=" + selected.SensorName +
+                             " | temp=" + (selected.HasTemperature ? selected.Temperature.ToString("F2") : "N/A"));
+                _form.SetSelection(_config.TemperatureSource, _config.GpuId);
+            }
+        }
+
+        private GpuReading FindGpu(string gpuId)
+        {
+            if (_snapshot == null || string.IsNullOrEmpty(gpuId)) return null;
+            foreach (GpuReading gpu in _snapshot.Gpus)
+            {
+                if (gpu.Id == gpuId) return gpu;
+            }
+            return null;
+        }
+
+        private static GpuReading ChooseDefaultGpu(List<GpuReading> gpus)
+        {
+            GpuReading best = null;
+            foreach (GpuReading gpu in gpus)
+            {
+                if (!gpu.IsIntegrated && gpu.HasTemperature &&
+                    gpu.SensorName != null && gpu.SensorName.ToLowerInvariant().Contains("gpu core"))
+                {
+                    return gpu;
+                }
+            }
+            foreach (GpuReading gpu in gpus)
+            {
+                if (!gpu.IsIntegrated && gpu.HasTemperature) return gpu;
+            }
+            foreach (GpuReading gpu in gpus)
+            {
+                if (gpu.HasTemperature) return gpu;
+            }
+            foreach (GpuReading gpu in gpus)
+            {
+                if (best == null) best = gpu;
+            }
+            return best;
+        }
+
+        private void UpdateSourceChecks()
+        {
+            bool cpu = _config.TemperatureSource != "GPU";
+            _cpuItem.Checked = cpu;
+            _gpuItem.Checked = !cpu;
+        }
+
+        private void UpdateTrayText()
+        {
+            try
+            {
+                if (_config.TemperatureSource == "GPU")
+                {
+                    GpuReading gpu = FindGpu(_config.GpuId);
+                    if (gpu == null || !gpu.HasTemperature)
+                    {
+                        _tray.Text = "LOVINGCOOL Mini · GPU 温度不可用";
+                    }
+                    else
+                    {
+                        _tray.Text = Truncate("LOVINGCOOL Mini · GPU " + gpu.Temperature.ToString("F1") + "°C", 63);
+                    }
+                }
+                else
+                {
+                    if (_snapshot == null || !_snapshot.CpuAvailable)
+                    {
+                        _tray.Text = "LOVINGCOOL Mini · CPU 温度不可用";
+                    }
+                    else
+                    {
+                        _tray.Text = Truncate("LOVINGCOOL Mini · CPU " + _snapshot.CpuTemperature.ToString("F1") + "°C", 63);
+                    }
+                }
+            }
+            catch
+            {
             }
         }
 
@@ -277,14 +414,22 @@ namespace LovingCoolMini
                         _lastSentTemp = int.MinValue;
                     }
 
-                    SensorReading reading = _latest;
-                    if (reading == null || (DateTime.Now - reading.Time).TotalSeconds > 5)
+                    SensorSnapshot snapshot = _snapshot;
+                    if (snapshot == null || (DateTime.Now - snapshot.Time).TotalSeconds > 5)
                     {
                         Thread.Sleep(300);
                         continue;
                     }
 
-                    int temperature = (int)Math.Round(reading.Tctl, MidpointRounding.AwayFromZero);
+                    int temperature;
+                    string sourceLabel;
+                    if (!TryGetSelectedTemperature(snapshot, out temperature, out sourceLabel))
+                    {
+                        _lastSentTemp = int.MinValue;
+                        Thread.Sleep(300);
+                        continue;
+                    }
+
                     bool due = temperature != _lastSentTemp ||
                                (DateTime.Now - _lastHeartbeat).TotalSeconds >= _config.HeartbeatSeconds;
                     if (due)
@@ -294,11 +439,16 @@ namespace LovingCoolMini
                             if (!_firstWriteLogged)
                             {
                                 _firstWriteLogged = true;
-                                _logger.Info("首次写入面板: " + temperature + "°C");
+                                _logger.Info("首次写入面板: " + sourceLabel + " " + temperature + "°C");
+                            }
+                            if (_lastWriteSource != sourceLabel)
+                            {
+                                _lastWriteSource = sourceLabel;
+                                _logger.Info("面板写入来源切换为 " + sourceLabel + ": " + temperature + "°C");
                             }
                             _lastSentTemp = temperature;
                             _lastHeartbeat = DateTime.Now;
-                            _form.UpdateHidStatus(true, "面板已连接 · 显示 " + temperature + "°C");
+                            _form.UpdateHidStatus(true, "面板已连接 · " + sourceLabel + " " + temperature + "°C");
                         }
                         else
                         {
@@ -315,6 +465,57 @@ namespace LovingCoolMini
                 }
                 Thread.Sleep(200);
             }
+        }
+
+        private bool TryGetSelectedTemperature(SensorSnapshot snapshot, out int temperature, out string sourceLabel)
+        {
+            if (_config.TemperatureSource == "GPU")
+            {
+                GpuReading gpu = FindGpu(_config.GpuId);
+                if (gpu == null || !gpu.HasTemperature)
+                {
+                    temperature = 0;
+                    sourceLabel = "GPU";
+                    return false;
+                }
+                temperature = (int)Math.Round(gpu.Temperature, MidpointRounding.AwayFromZero);
+                sourceLabel = "GPU";
+                return true;
+            }
+
+            if (!snapshot.CpuAvailable)
+            {
+                temperature = 0;
+                sourceLabel = "CPU";
+                return false;
+            }
+            temperature = (int)Math.Round(snapshot.CpuTemperature, MidpointRounding.AwayFromZero);
+            sourceLabel = "CPU";
+            return true;
+        }
+
+        private void FormSourceChanged(object sender, EventArgs e)
+        {
+            _config.TemperatureSource = _form.SelectedSource;
+            _config.GpuId = _form.SelectedGpuId;
+            _config.Save(_logger);
+            _logger.Info("温度来源切换: " + _config.TemperatureSource +
+                         (_config.TemperatureSource == "GPU" ? " (" + _config.GpuId + ")" : string.Empty));
+            _lastSentTemp = int.MinValue;
+            _lastHeartbeat = DateTime.MinValue;
+            UpdateSourceChecks();
+            UpdateTrayText();
+        }
+
+        private void FormGpuChanged(object sender, EventArgs e)
+        {
+            _config.GpuId = _form.SelectedGpuId;
+            _config.Save(_logger);
+            GpuReading gpu = FindGpu(_config.GpuId);
+            _logger.Info("显卡选择: " + (gpu == null ? _config.GpuId : gpu.Name + " | " + gpu.Id));
+            _lastSentTemp = int.MinValue;
+            _lastHeartbeat = DateTime.MinValue;
+            UpdateTrayText();
         }
 
         private void FormAutoStartClicked(object sender, EventArgs e)
@@ -344,6 +545,30 @@ namespace LovingCoolMini
         {
             _logger.Info("双击托盘显示主窗口");
             _form.ShowFromTray();
+        }
+
+        private void CpuItemClick(object sender, EventArgs e)
+        {
+            SetSource("CPU");
+        }
+
+        private void GpuItemClick(object sender, EventArgs e)
+        {
+            SetSource("GPU");
+        }
+
+        private void SetSource(string source)
+        {
+            if (_config.TemperatureSource == source) return;
+            _config.TemperatureSource = source;
+            EnsureSelectedGpu();
+            _config.Save(_logger);
+            _logger.Info("托盘切换温度来源: " + source);
+            _form.SetSelection(_config.TemperatureSource, _config.GpuId);
+            _lastSentTemp = int.MinValue;
+            _lastHeartbeat = DateTime.MinValue;
+            UpdateSourceChecks();
+            UpdateTrayText();
         }
 
         private void AutoStartItemClick(object sender, EventArgs e)

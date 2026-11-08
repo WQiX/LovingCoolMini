@@ -14,6 +14,8 @@ namespace LovingCoolMini
         [DataMember] public int RefreshMs;
         [DataMember] public int HeartbeatSeconds;
         [DataMember] public string LastSerial;
+        [DataMember] public string TemperatureSource;
+        [DataMember] public string GpuId;
 
         public AppConfig()
         {
@@ -23,6 +25,8 @@ namespace LovingCoolMini
             RefreshMs = 1000;
             HeartbeatSeconds = 5;
             LastSerial = string.Empty;
+            TemperatureSource = "CPU";
+            GpuId = string.Empty;
         }
 
         public static string AppDir
@@ -84,6 +88,11 @@ namespace LovingCoolMini
             if (HeartbeatSeconds < 2) HeartbeatSeconds = 2;
             if (HeartbeatSeconds > 60) HeartbeatSeconds = 60;
             if (LastSerial == null) LastSerial = string.Empty;
+            if (TemperatureSource != "CPU" && TemperatureSource != "GPU")
+            {
+                TemperatureSource = "CPU";
+            }
+            if (GpuId == null) GpuId = string.Empty;
         }
 
         public void Save(Logger logger)

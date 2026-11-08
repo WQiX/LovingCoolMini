@@ -21,14 +21,14 @@
 |---|---|---|
 | 0 | `0x01` | HID Report ID |
 | 1 | `0x01` | AP Series 命令/页面 |
-| 2 | 0–255 | CPU 温度（整数 °C） |
+| 2 | 0–255 | 当前选择的 CPU 或 GPU 温度（整数 °C） |
 | 3 | 0–255 | CPU 使用率（%） |
 | 4 | 0–255 | CPU 功耗（W） |
 | 5 | 高字节 | 风扇转速 16 位高字节 |
 | 6 | 低字节 | 风扇转速 16 位低字节 |
 | 7–34 | `0x00` | 补零到 35 字节 |
 
-本程序只需要温度，因此偏移 3–6 填 0；实机验证面板仍正常显示温度。
+本程序只需要温度，因此偏移 3–6 填 0；实机验证面板仍正常显示温度。面板只显示数字，不区分 CPU/GPU；来源由程序界面标注。
 
 ## 原版前端逻辑
 
@@ -45,8 +45,9 @@
 
 LibreHardwareMonitorLib 0.9.4（net472），读取：
 
-- `HardwareType.Cpu`
-- `SensorType.Temperature`
-- 优先 `Core (Tctl/Tdie)`
+- CPU：`HardwareType.Cpu`，`SensorType.Temperature`，优先 `Core (Tctl/Tdie)`
+- GPU：`HardwareType.GpuNvidia` / `GpuAmd` / `GpuIntel`，优先 `GPU Core`，其次 `GPU Temperature`、`GPU Diode`、`GPU Edge`；核显可用 `GPU VR SoC`
+- 多 GPU 时由界面选择，默认优先有 `GPU Core` 温度的独立显卡
+- GPU 温度不可用时暂停写面板，并在界面说明原因，不写 0
 
-需要管理员权限；无管理员权限时 LHM 会打开但温度恒为 0。
+CPU 温度需要管理员权限；无管理员权限时 LHM 会打开但 CPU 温度恒为 0。GPU 温度在普通权限下通常也能读取。
